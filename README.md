@@ -1,7 +1,7 @@
 # DVR
 
 [![CI](https://github.com/liquidgecka/dvr/actions/workflows/ci.yml/badge.svg)](https://github.com/liquidgecka/dvr/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/liquidgecka/dvr.svg)](https://pkg.go.dev/github.com/liquidgecka/dvr)
+[![Go Reference](https://pkg.go.dev/badge/github.com/liquidgecka/dvr/v2.svg)](https://pkg.go.dev/github.com/liquidgecka/dvr/v2)
 
 DVR is a Go library for capturing and replaying HTTP calls during tests.
 
@@ -13,7 +13,7 @@ state or `init()` side effects.
 ## Installation
 
 ```bash
-go get github.com/liquidgecka/dvr
+go get github.com/liquidgecka/dvr/v2
 ```
 
 Requires Go 1.26 or later.
@@ -31,7 +31,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/liquidgecka/dvr"
+	"github.com/liquidgecka/dvr/v2"
 )
 
 func TestAPI(t *testing.T) {
@@ -80,7 +80,7 @@ go test ./... -dvr.replay -dvr.file testdata/api.dvr
 * Use `dvr.WithMatcher(...)` to customize how incoming requests are matched
   against recorded entries during replay.
 
-See the full API documentation on [pkg.go.dev](https://pkg.go.dev/github.com/liquidgecka/dvr).
+See the full API documentation on [pkg.go.dev](https://pkg.go.dev/github.com/liquidgecka/dvr/v2).
 
 ## Contribution
 

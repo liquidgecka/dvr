@@ -1,4 +1,4 @@
-module github.com/liquidgecka/dvr
+module github.com/liquidgecka/dvr/v2
 
 go 1.26
 

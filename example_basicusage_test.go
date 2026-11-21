@@ -23,7 +23,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/liquidgecka/dvr"
+	"github.com/liquidgecka/dvr/v2"
 )
 
 func Example_recordAndReplay() {
