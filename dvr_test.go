@@ -94,11 +94,11 @@ type savedQuery struct {
 
 func runTests(
 	ctx context.Context,
-	T *testlib.T,
+	tl *testlib.T,
 	rt http.RoundTripper,
 	baseURL, username, password string,
 ) []*savedQuery {
-	T.Helper()
+	tl.Helper()
 
 	makeRequest := func(path, method, body string) *savedQuery {
 		sq := &savedQuery{}
@@ -106,7 +106,7 @@ func runTests(
 		req, err := http.NewRequestWithContext(
 			ctx, method, baseURL+path, io.NopCloser(strings.NewReader(body)),
 		)
-		T.ExpectSuccess(err)
+		tl.ExpectSuccess(err)
 		req.Header.Add("X-Client-Header", "test")
 		req.ContentLength = int64(len(body))
 		if username != "" || password != "" {
@@ -137,7 +137,7 @@ func runTests(
 
 		bodyReader, bodyWriter := io.Pipe()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, bodyReader)
-		T.ExpectSuccess(err)
+		tl.ExpectSuccess(err)
 		req.Header.Add("X-Client-Header", "test")
 
 		sq.Request = req
