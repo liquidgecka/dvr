@@ -20,258 +20,237 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
-	"reflect"
-	"strings"
+	"slices"
 )
 
-// This function is used by the replay component of this library to determine
-// if an incoming request matches a request from the archive. If this function
-// returns true then the requests are deemed to have "matched". Note that
-// mutation of either object (other than the UserData field) will likely
-// result in a panic or crash. The left object will not have Response* fields
-// populated.
-//
-// The default matcher will match a request if it Request's URL, Body, Headers
-// and Trailers are all the same.
-var Matcher func(left, right *RequestResponse) bool
-
-// This is the default implementation of Matcher()
-func matcher(left, right *RequestResponse) bool {
-	// For the default match we use UserData purely as a boolean where "nil"
-	// means "unseen" and "non nil" means seen.
-	if right == nil || left == nil {
+// DefaultMatcher matches an incoming request (left) against an unconsumed
+// recorded entry (right) by comparing HTTP method, URL components, request
+// body bytes, headers, and trailers. Once matched, right.UserData is set to
+// prevent matching the same recorded entry twice.
+func DefaultMatcher(left, right *RequestResponse) bool {
+	if left == nil || right == nil || right.UserData != nil {
 		return false
-	} else if right.UserData != nil {
-		return false
-	} else if right.Request == nil || left.Request == nil {
+	}
+	if left.Request == nil || right.Request == nil {
 		return false
 	}
 
 	lreq := left.Request
 	rreq := right.Request
 
-	// Case 1: URL elements match.
-	if lreq.URL == nil {
-		return false
-	} else if lreq.URL.Scheme != rreq.URL.Scheme {
-		return false
-	} else if lreq.URL.Opaque != rreq.URL.Opaque {
-		return false
-	} else if lreq.URL.Host != rreq.URL.Host {
-		return false
-	} else if lreq.URL.Path != rreq.URL.Path {
-		return false
-	} else if lreq.URL.RawQuery != rreq.URL.RawQuery {
-		return false
-	} else if lreq.URL.Fragment != rreq.URL.Fragment {
+	if effectiveMethod(lreq.Method) != effectiveMethod(rreq.Method) {
 		return false
 	}
 
-	// Case 1: URL.User
-	if lreq.URL.User != nil && rreq.URL.User == nil {
+	if lreq.URL == nil || rreq.URL == nil {
 		return false
-	} else if lreq.URL.User == nil && rreq.URL.User != nil {
-		return false
-	} else if lreq.URL.User != nil {
-		if lreq.URL.User.String() != rreq.URL.User.String() {
-			return false
-		}
 	}
-
-	// Case 2: Request Body match.
-	if bytes.Compare(left.RequestBody, right.RequestBody) != 0 {
+	if lreq.URL.Scheme != rreq.URL.Scheme ||
+		lreq.URL.Opaque != rreq.URL.Opaque ||
+		lreq.URL.Host != rreq.URL.Host ||
+		lreq.URL.Path != rreq.URL.Path ||
+		lreq.URL.RawPath != rreq.URL.RawPath ||
+		lreq.URL.RawQuery != rreq.URL.RawQuery ||
+		lreq.URL.Fragment != rreq.URL.Fragment {
 		return false
 	}
 
-	// Case 3: Headers and Trailers match.
-	if !reflect.DeepEqual(lreq.Header, rreq.Header) {
-		return false
-	}
-	if !reflect.DeepEqual(lreq.Trailer, rreq.Trailer) {
+	if !userInfoEqual(lreq.URL.User, rreq.URL.User) {
 		return false
 	}
 
-	right.UserData = right
+	if !bytes.Equal(left.RequestBody, right.RequestBody) {
+		return false
+	}
+
+	if !headersEqual(lreq.Header, rreq.Header) {
+		return false
+	}
+	if !headersEqual(lreq.Trailer, rreq.Trailer) {
+		return false
+	}
+
+	right.UserData = struct{}{}
 	return true
 }
 
-// the contents of the request are matched to ensure that the request is
-// appropriate.
-func (r *roundTripper) replaySetup() {
-	// Open the tar file for reading.
-	fd, err := os.OpenFile(fileName, os.O_RDONLY, os.FileMode(755))
-	panicIfError(err)
-
-	// Read the file version in.
-	version := uint32(0)
-	err = binary.Read(fd, binary.BigEndian, &version)
-	panicIfError(err)
-	if version != 1 {
-		panic(fmt.Errorf("Unknown version: %d", version))
+func effectiveMethod(method string) string {
+	if method == "" {
+		return http.MethodGet
 	}
-
-	// Make a gzip reader.
-	gzipReader, err := gzip.NewReader(fd)
-	panicIfError(err)
-
-	// Create the tar reader and the list used to store the results.
-	reader := tar.NewReader(gzipReader)
-	requestList = make([]*RequestResponse, 0, 100)
-
-	// While the archive has elements in it we loop through decoding them
-	// and adding them to a list.
-	for {
-		// Read the next header.
-		if _, err := reader.Next(); err == io.EOF {
-			break
-		} else {
-			panicIfError(err)
-		}
-
-		// Create a decoder and a list for us to store the results in.
-		gobDecoder := gob.NewDecoder(reader)
-
-		// Read the results from the stream.
-		gobQuery := gobQuery{}
-		panicIfError(gobDecoder.Decode(&gobQuery))
-
-		// Add the query to the list.
-		requestList = append(requestList, gobQuery.RequestResponse())
-	}
-
-	// Close the file.
-	panicIfError(fd.Close())
+	return method
 }
 
-// This is the RoundTrip() call when we are in replay mode.
-func (r *roundTripper) replay(req *http.Request) (*http.Response, error) {
-	// Ensure that the replay system is setup.
-	isSetup.Do(r.replaySetup)
+func userInfoEqual(a, b *url.Userinfo) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.String() == b.String()
+}
 
-	// Read the body into a buffer.
-	buffer := &bytes.Buffer{}
-	var reqErr error
+func headersEqual(a, b http.Header) bool {
+	return maps.EqualFunc(a, b, slices.Equal[[]string])
+}
+
+func (r *Recorder) loadForReplay() error {
+	f, err := os.Open(r.filePath)
+	if err != nil {
+		return fmt.Errorf("dvr: open archive for reading: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	var version uint32
+	if err := binary.Read(f, binary.BigEndian, &version); err != nil {
+		return fmt.Errorf("dvr: read archive version: %w", err)
+	}
+	if version != archiveVersion {
+		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, version)
+	}
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("dvr: open gzip reader: %w", err)
+	}
+	defer func() { _ = gz.Close() }()
+
+	tr := tar.NewReader(gz)
+	var entries []*RequestResponse
+	for {
+		_, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("dvr: read archive entry: %w", err)
+		}
+
+		var q gobQuery
+		if err := gob.NewDecoder(tr).Decode(&q); err != nil {
+			return fmt.Errorf("dvr: decode archive entry: %w", err)
+		}
+
+		rr, err := q.toRequestResponse()
+		if err != nil {
+			return err
+		}
+		entries = append(entries, rr)
+	}
+
+	r.entries = entries
+	return nil
+}
+
+func (r *Recorder) replay(req *http.Request) (*http.Response, error) {
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+
+	var reqBuf bytes.Buffer
+	var reqBodyErr error
 	if req.Body != nil {
-		_, reqErr = io.Copy(buffer, req.Body)
+		_, reqBodyErr = io.Copy(&reqBuf, req.Body)
+		_ = req.Body.Close()
 	}
 
-	// Since this function deals with the requestList we need to lock.
-	requestLock.Lock()
-	defer requestLock.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	// Figure out which match function to use.
-	f := Matcher
-	if f == nil {
-		f = matcher
+	if r.closed {
+		return nil, ErrClosed
 	}
 
-	// Walk through the objects in our archive list and see if any of them
-	// match the incoming request.
 	rrSource := &RequestResponse{
 		Request:          req,
-		RequestBody:      buffer.Bytes(),
-		RequestBodyError: reqErr,
+		RequestBody:      reqBuf.Bytes(),
+		RequestBodyError: reqBodyErr,
 	}
 
 	var rrMatch *RequestResponse
-	for _, rr := range requestList {
-		if f(rrSource, rr) {
+	for _, rr := range r.entries {
+		if r.matcher(rrSource, rr) {
 			rrMatch = rr
 			break
 		}
 	}
+
 	if rrMatch == nil {
-		messageLines := []string{
-			"Matcher didn't match any execeted queries.\n",
-			"Details of the failed request:",
-			"",
-			fmt.Sprintf("URL: %s", req.URL.String()),
-			fmt.Sprintf("Method: %s", req.Method),
+		var rawURL string
+		if req.URL != nil {
+			rawURL = req.URL.String()
 		}
-		if len(req.Header) > 0 {
-			messageLines = append(messageLines, "\nHeaders:")
-			for key, value := range req.Header {
-				messageLines = append(messageLines,
-					fmt.Sprintf("    %s: %s", key, strings.Join(value, ", ")))
-			}
+		return nil, &NoMatchError{
+			Method:  effectiveMethod(req.Method),
+			URL:     rawURL,
+			Header:  req.Header.Clone(),
+			Trailer: req.Trailer.Clone(),
+			Body:    bytes.Clone(reqBuf.Bytes()),
 		}
-		if len(req.Trailer) > 0 {
-			messageLines = append(messageLines, "\nTrailers:")
-			for key, value := range req.Trailer {
-				messageLines = append(messageLines,
-					fmt.Sprintf("    %s: %s", key, strings.Join(value, ", ")))
-			}
-		}
-		if len(buffer.Bytes()) > 0 {
-			// This block is written a little funky in order to make testing
-			// easier since it doesn't if/else as much.
-			messageLines = append(messageLines, "Body:")
-			length := len(buffer.Bytes())
-			warning := ""
-			if length > 512 {
-				length = 512
-				warning = "... (content truncated by dvr)"
-			}
-			messageLines = append(messageLines,
-				string(buffer.Bytes()[:length])+warning)
-		}
-		panicIfError(fmt.Errorf(strings.Join(messageLines, "\n")))
 	}
 
-	// Check to see if the response was an error when recorded.
 	if rrMatch.Response == nil {
 		return nil, rrMatch.Error
 	}
 
-	// Setup our response object.
 	resp := new(http.Response)
 	*resp = *rrMatch.Response
+	if rrMatch.Response.Header != nil {
+		resp.Header = rrMatch.Response.Header.Clone()
+	} else {
+		resp.Header = make(http.Header)
+	}
+	if rrMatch.Response.Trailer != nil {
+		resp.Trailer = rrMatch.Response.Trailer.Clone()
+	}
 	resp.Request = req
-
-	// Lastly we need to setup a bodyWriter for the Body. This will allow the
-	// client to read the body we captured and it will return the error we
-	// captured (if any) rather than EOF.
-	resp.Body = &bodyWriter{
+	resp.Body = &bodyReader{
 		data: rrMatch.ResponseBody,
 		err:  rrMatch.ResponseBodyError,
 	}
 
-	// And lastly we return the response.
 	return resp, rrMatch.Error
 }
 
-//
-// bodyWriter
-//
-
-// This structure is used for writing the output from the server back to the
-// caller. It repeats the bytes we recorded and returns the error we initially
-// captured.
-type bodyWriter struct {
+type bodyReader struct {
 	offset int
 	data   []byte
 	err    error
 }
 
-// io.Reader
-func (b *bodyWriter) Read(input []byte) (int, error) {
+func (b *bodyReader) Read(p []byte) (int, error) {
 	if b.offset >= len(b.data) {
 		if b.err == nil {
 			return 0, io.EOF
-		} else {
-			return 0, b.err
 		}
+		return 0, b.err
 	}
-	n := copy(input, b.data[b.offset:])
+	n := copy(p, b.data[b.offset:])
 	b.offset += n
 	return n, nil
 }
 
-// io.Closer
-func (b *bodyWriter) Close() error {
+func (b *bodyReader) WriteTo(w io.Writer) (int64, error) {
+	var total int64
+	if b.offset < len(b.data) {
+		n, err := w.Write(b.data[b.offset:])
+		b.offset += n
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, b.err
+}
+
+func (b *bodyReader) Close() error {
 	return nil
 }

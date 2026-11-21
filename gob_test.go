@@ -16,124 +16,140 @@ package dvr
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"errors"
-	"io/ioutil"
-	"net/http"
+	"io"
+	"net"
 	"reflect"
 	"testing"
 
 	"github.com/liquidgecka/testlib"
 )
 
-// An error implementation that is unknown to the decoder.
 type customError string
 
 func (p customError) Error() string {
 	return string(p)
 }
 
+type registeredStructError struct {
+	Code    int
+	Message string
+}
+
+func (e *registeredStructError) Error() string {
+	return e.Message
+}
+
+func init() {
+	RegisterErrorType(new(registeredStructError))
+}
+
 func TestGobError_GobEncode(t *testing.T) {
 	T := testlib.NewT(t)
 	defer T.Finish()
 
-	// Test 1: An unencodable error.
-
-	g := &gobError{Error: customError("Unexpected")}
-
-	// Encode the error.
-	buffer := &bytes.Buffer{}
-	encoder := gob.NewEncoder(buffer)
-	T.ExpectSuccess(encoder.Encode(g))
-
-	// Decode the byte array to see what was returned.
-	g2 := new(gobError)
-	decoder := gob.NewDecoder(buffer)
-	T.ExpectSuccess(decoder.Decode(g2))
-
-	// Make sure that the two encoded objects types are NOT the same.
-	T.NotEqual(g, g2)
-
-	// Ensure that the type of g2.Error is actually a gobSafeError
-	if _, ok := g2.Error.(*gobSafeError); !ok {
-		T.Fatalf("g2.Error is not a gobSafeEror, its a %T", g2.Error)
+	roundTrip := func(err error) error {
+		g := &gobError{Error: err}
+		var buf bytes.Buffer
+		T.ExpectSuccess(gob.NewEncoder(&buf).Encode(g))
+		var out gobError
+		T.ExpectSuccess(gob.NewDecoder(&buf).Decode(&out))
+		return out.Error
 	}
 
-	// Test 2: An encodable error.
+	// Unregistered error falls back to gobSafeError with matching text.
+	got := roundTrip(customError("Unexpected"))
+	safeErr, ok := got.(gobSafeError)
+	T.Equal(ok, true)
+	T.Equal(safeErr.Error(), "Unexpected")
 
-	g = &gobError{Error: &http.ProtocolError{ErrorString: "Expected"}}
-
-	// Encode the error.
-	buffer = &bytes.Buffer{}
-	encoder = gob.NewEncoder(buffer)
-	T.ExpectSuccess(encoder.Encode(g))
-
-	// Decode the byte array to see what was returned.
-	g2 = new(gobError)
-	decoder = gob.NewDecoder(buffer)
-	T.ExpectSuccess(decoder.Decode(g2))
-
-	// Ensure that the two encoded objects ARE the same.
-	T.Equal(g, g2)
-
-	// Ensure that the type of g2.Error is actually a *http.ProtocolError
-	if _, ok := g2.Error.(*http.ProtocolError); !ok {
-		T.Fatalf("g2.Error is not a *http.ProtocolError, its a %T", g2.Error)
+	// Built-in registered error type (*net.DNSError) preserves type and fields.
+	dnsErr := &net.DNSError{Err: "no such host", Name: "example.invalid"}
+	gotDNS := roundTrip(dnsErr)
+	T.Equal(gotDNS, dnsErr)
+	if _, ok := gotDNS.(*net.DNSError); !ok {
+		T.Fatalf("gotDNS is not *net.DNSError, got %T", gotDNS)
 	}
 
-	// Test 3: An errors.stringError object.
+	// User-registered error type preserves type and fields.
+	regErr := &registeredStructError{Code: 42, Message: "boom"}
+	gotReg := roundTrip(regErr)
+	T.Equal(gotReg, regErr)
 
-	g = &gobError{Error: errors.New("Expected")}
+	// errors.New preserves *errors.errorString type.
+	errString := errors.New("Expected")
+	gotErrString := roundTrip(errString)
+	T.Equal(gotErrString, errString)
+	T.Equal(reflect.TypeOf(gotErrString), reflect.TypeOf(errString))
 
-	// Encode the error.
-	buffer = &bytes.Buffer{}
-	encoder = gob.NewEncoder(buffer)
-	T.ExpectSuccess(encoder.Encode(g))
-
-	// Decode the byte array to see what was returned.
-	g2 = new(gobError)
-	decoder = gob.NewDecoder(buffer)
-	T.ExpectSuccess(decoder.Decode(g2))
-
-	// Ensure that the two encoded objects ARE the same.
-	T.Equal(g, g2)
-
-	// Ensure that the type of g2.Error is actually a *http.ProtocolError
-	if reflect.TypeOf(g.Error) != reflect.TypeOf(g2.Error) {
-		T.Fatalf("g2.Error is not a *http.ProtocolError, its a %T", g2.Error)
+	// Sentinel errors preserve identity.
+	for _, sentinel := range []error{
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		context.Canceled,
+		context.DeadlineExceeded,
+	} {
+		gotSentinel := roundTrip(sentinel)
+		T.Equal(errors.Is(gotSentinel, sentinel), true)
+		T.Equal(gotSentinel == sentinel, true)
 	}
+
+	// Registered wrapper error wrapping an unregistered inner error falls back cleanly.
+	wrapped := &net.OpError{Op: "dial", Net: "tcp", Err: customError("inner")}
+	gotWrapped := roundTrip(wrapped)
+	T.NotEqual(gotWrapped, nil)
+	T.Equal(gotWrapped.Error(), wrapped.Error())
+
+	// Nil and typed-nil errors decode as nil.
+	T.Equal(roundTrip(nil), nil)
+	var typedNil *net.DNSError
+	T.Equal(roundTrip(typedNil), nil)
+
+	// RegisterErrorType ignores nil and handles typed nil safely.
+	RegisterErrorType(nil)
+	RegisterErrorType(typedNil)
 }
 
 func TestGobError_GobDecode(t *testing.T) {
 	T := testlib.NewT(t)
 	defer T.Finish()
-	// Most of the Decoding tests are in TestGobError_GobEncode other than
-	// a simple bogus data check.
-	g := &gobError{}
+
+	var g gobError
 	T.ExpectError(g.GobDecode([]byte{0, 1, 2, 3}))
+
+	g.Error = errors.New("stale")
+	T.ExpectSuccess(g.GobDecode(nil))
+	T.Equal(g.Error, nil)
 }
 
-func TestGobQuery_RequestResponse(t *testing.T) {
+func TestGobQuery_ToRequestResponse(t *testing.T) {
 	T := testlib.NewT(t)
 	defer T.Finish()
-	defer func() {
-		err := recover()
-		if err == nil {
-			T.Fatalf("The expected panic didn't happen")
-		} else if _, ok := err.(*dvrFailure); !ok {
-			T.Fatalf("An unexpected panic happened: %#v", err)
-		}
-	}()
-	panicOutput = ioutil.Discard
-	gq := &gobQuery{Request: new(gobRequest)}
-	gq.Request.URL = "://"
-	gq.RequestResponse()
-	T.Fatalf("The above call should never return.")
-}
 
-func TestSimpleCoverage(t *testing.T) {
-	T := testlib.NewT(t)
-	defer T.Finish()
+	gq := &gobQuery{
+		Request: &gobRequest{URL: "://"},
+	}
+	_, err := gq.toRequestResponse()
+	T.ExpectError(err)
+
+	badCertQuery := &gobQuery{
+		Response: &gobResponse{
+			TLS: &gobTLSState{
+				PeerCertificates: [][]byte{{1, 2, 3}},
+			},
+		},
+	}
+	_, err = badCertQuery.toRequestResponse()
+	T.ExpectError(err)
+
 	T.Equal(newGobRequest(nil), nil)
 	T.Equal(newGobResponse(nil), nil)
+	T.Equal(newGobTLSState(nil), nil)
+
+	var nilTLS *gobTLSState
+	cs, err := nilTLS.toTLSConnectionState()
+	T.ExpectSuccess(err)
+	T.Equal(cs, nil)
 }

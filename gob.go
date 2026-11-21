@@ -16,171 +16,292 @@ package dvr
 
 import (
 	"bytes"
-	"crypto/rsa"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"sync"
 )
 
-//
-// Error wrapper
-//
+const archiveVersion uint32 = 1
 
-// This is a safe type that will always be able to be gob encoded.
+// gobSafeError is a gob-encodable string error used as a fallback when an
+// error value's concrete type is not registered with encoding/gob.
 type gobSafeError string
 
-// Error() for gobSafeError
+// Error implements the error interface.
 func (g gobSafeError) Error() string {
 	return string(g)
 }
 
-// This is the list of known encodable types saved as a map of name -> bool.
-// This allows us to know if a given type will be decodable or not.. If not
-// then we need to wrap the type in a gobSafeError structure.
-var encodableTypes map[string]bool = map[string]bool{}
+var (
+	encodableTypesMu sync.RWMutex
+	encodableTypes   = map[string]bool{}
+)
 
-// Initialize encodableTypes
+var knownSentinels = []struct {
+	name string
+	err  error
+}{
+	{name: "io.EOF", err: io.EOF},
+	{name: "io.ErrUnexpectedEOF", err: io.ErrUnexpectedEOF},
+	{name: "context.Canceled", err: context.Canceled},
+	{name: "context.DeadlineExceeded", err: context.DeadlineExceeded},
+}
+
+var sentinelByName = map[string]error{
+	"io.EOF":                   io.EOF,
+	"io.ErrUnexpectedEOF":      io.ErrUnexpectedEOF,
+	"context.Canceled":         context.Canceled,
+	"context.DeadlineExceeded": context.DeadlineExceeded,
+}
+
 func init() {
-	// Error return types.
-	RegisterErrorType(new(gobSafeError))
-	RegisterErrorType(new(http.ProtocolError))
+	RegisterErrorType(gobSafeError(""))
 	RegisterErrorType(new(net.AddrError))
 	RegisterErrorType(new(net.DNSConfigError))
 	RegisterErrorType(new(net.DNSError))
-	RegisterErrorType(new(net.DNSError))
-	RegisterErrorType(new(net.InvalidAddrError))
+	RegisterErrorType(net.InvalidAddrError(""))
 	RegisterErrorType(new(net.OpError))
 	RegisterErrorType(new(net.ParseError))
-	RegisterErrorType(new(net.UnknownNetworkError))
+	RegisterErrorType(net.UnknownNetworkError(""))
 	RegisterErrorType(new(url.Error))
-	RegisterErrorType(new(url.EscapeError))
+	RegisterErrorType(url.EscapeError(""))
+	RegisterErrorType(url.InvalidHostError(""))
 
-	// Other objects that we might end up seeing.
-	gob.Register(new(rsa.PublicKey))
-	gob.Register(new(rsa.PrivateKey))
 	gob.Register(new(net.TCPAddr))
+	gob.Register(new(net.UDPAddr))
+	gob.Register(new(net.IPAddr))
 }
 
-// Adds an error interface object to the list of known types that this library
-// will be able to encode. This is necessary due to the way that gob encodes
-// interface object. The only error types here are those that will be returned
-// from the RoundTripper object. Typical use cases should not need this at all.
-// If you are using this you must do it via your modules init() otherwise
-// results can be unpredictable.
+// RegisterErrorType registers err's concrete type with encoding/gob so that
+// error values of that type preserve their dynamic type across record and
+// replay. Calls should typically be made during package initialization before
+// recording or replaying begins.
 func RegisterErrorType(err error) {
-	// Walk the given interface all the way down to the raw object.
-	value := reflect.ValueOf(err)
-	for value.Kind() == reflect.Interface || value.Kind() == reflect.Ptr {
-		if _, ok := value.Interface().(error); ok {
-			gob.Register(value.Interface())
-		}
-		value = value.Elem()
+	if err == nil {
+		return
 	}
-	typ := value.Type()
+
+	gob.Register(err)
+
+	typ := reflect.TypeOf(err)
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
 	id := fmt.Sprintf("%s.%s", typ.PkgPath(), typ.Name())
+
+	encodableTypesMu.Lock()
 	encodableTypes[id] = true
+	encodableTypesMu.Unlock()
 }
 
-// This type is used to store errors. Since some errors might contain private
-// fields we need to ensure that we can still convert them as best as possible.
-// Specifically this will convert them to a string error.
+type gobRawError struct {
+	Error             error
+	ErrorsErrorString bool
+	Sentinel          string
+}
+
 type gobError struct {
 	Error error
 }
 
-// The encoder that allows us to safely convert errors.
-func (g *gobError) GobEncode() ([]byte, error) {
+func (g gobError) GobEncode() ([]byte, error) {
 	if g.Error == nil {
 		return []byte{}, nil
 	}
 
-	// If we are encoding a known safe type then we write the types name and
-	// then encode it into the byte stream, otherwise we are forced to convert
-	// it into a gobSafeError type so it can be safely stored.
+	for _, s := range knownSentinels {
+		if g.Error == s.err {
+			var buf bytes.Buffer
+			err := gob.NewEncoder(&buf).Encode(&gobRawError{Sentinel: s.name})
+			return buf.Bytes(), err
+		}
+	}
+
 	value := reflect.ValueOf(g.Error)
-	for value.Kind() == reflect.Interface || value.Kind() == reflect.Ptr {
+	for value.IsValid() && (value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer) {
+		if value.IsNil() {
+			return []byte{}, nil
+		}
 		value = value.Elem()
 	}
+	if !value.IsValid() {
+		return []byte{}, nil
+	}
 
-	// Figure out the name of this object type.
-	id := fmt.Sprintf("%s.%s", value.Type().PkgPath(), value.Type().Name())
+	typ := value.Type()
+	id := fmt.Sprintf("%s.%s", typ.PkgPath(), typ.Name())
 
-	// Make a safe error object for us to encode with.
-	rawError := gobRawError{
-		Error:             g.Error,
+	encodableTypesMu.RLock()
+	registered := encodableTypes[id]
+	encodableTypesMu.RUnlock()
+
+	if registered {
+		var buf bytes.Buffer
+		raw := gobRawError{Error: g.Error}
+		if err := gob.NewEncoder(&buf).Encode(&raw); err == nil {
+			return buf.Bytes(), nil
+		}
+	}
+
+	raw := gobRawError{
+		Error:             gobSafeError(g.Error.Error()),
 		ErrorsErrorString: id == "errors.errorString",
 	}
-
-	// If the object that we are encoding is not safe then we need to change
-	// it into one that actually is.
-	if _, ok := encodableTypes[id]; !ok {
-		rawError.Error = gobSafeError(g.Error.Error())
-	}
-
-	// Encode the safe object and return the byte array.
-	buffer := bytes.Buffer{}
-	encoder := gob.NewEncoder(&buffer)
-	err := encoder.Encode(&rawError)
-	return buffer.Bytes(), err
+	var buf bytes.Buffer
+	err := gob.NewEncoder(&buf).Encode(&raw)
+	return buf.Bytes(), err
 }
 
-// Decodes a gobError struct
 func (g *gobError) GobDecode(data []byte) error {
 	if len(data) == 0 {
 		g.Error = nil
 		return nil
 	}
-	buffer := bytes.NewBuffer(data)
-	decoder := gob.NewDecoder(buffer)
+
 	var rawError gobRawError
-	if err := decoder.Decode(&rawError); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&rawError); err != nil {
 		return err
 	}
 
-	if rawError.ErrorsErrorString {
+	switch {
+	case rawError.Sentinel != "":
+		if err, ok := sentinelByName[rawError.Sentinel]; ok {
+			g.Error = err
+			return nil
+		}
+		g.Error = gobSafeError(rawError.Sentinel)
+	case rawError.ErrorsErrorString:
 		g.Error = errors.New(rawError.Error.Error())
-	} else {
+	default:
 		g.Error = rawError.Error
 	}
 	return nil
 }
 
-// This is the object type that gobError will use when encoding and decoding.
-// The assumption here is that the Error field in this object will be populated
-// only with safe error types.
-type gobRawError struct {
-	Error error
-
-	// This is set to true if the error was initially a 'errors.errorString'
-	// so we know that we can convert it back in the decoding process.
-	ErrorsErrorString bool
+type gobTLSState struct {
+	Version                     uint16
+	HandshakeComplete           bool
+	DidResume                   bool
+	CipherSuite                 uint16
+	CurveID                     tls.CurveID
+	NegotiatedProtocol          string
+	ServerName                  string
+	PeerCertificates            [][]byte
+	VerifiedChains              [][][]byte
+	SignedCertificateTimestamps [][]byte
+	OCSPResponse                []byte
+	TLSUnique                   []byte
+	ECHAccepted                 bool
+	HelloRetryRequest           bool
 }
 
-//
-// bytes.Buffer with a Close() call.
-//
+func newGobTLSState(cs *tls.ConnectionState) *gobTLSState {
+	if cs == nil {
+		return nil
+	}
 
-// This structure is just a bytes.Buffer with a Close() method.
-type bytesBufferCloser struct {
-	bytes.Buffer
+	state := &gobTLSState{
+		Version:                     cs.Version,
+		HandshakeComplete:           cs.HandshakeComplete,
+		DidResume:                   cs.DidResume,
+		CipherSuite:                 cs.CipherSuite,
+		CurveID:                     cs.CurveID,
+		NegotiatedProtocol:          cs.NegotiatedProtocol,
+		ServerName:                  cs.ServerName,
+		SignedCertificateTimestamps: cs.SignedCertificateTimestamps,
+		OCSPResponse:                cs.OCSPResponse,
+		TLSUnique:                   cs.TLSUnique,
+		ECHAccepted:                 cs.ECHAccepted,
+		HelloRetryRequest:           cs.HelloRetryRequest,
+	}
+
+	if len(cs.PeerCertificates) > 0 {
+		state.PeerCertificates = make([][]byte, len(cs.PeerCertificates))
+		for i, cert := range cs.PeerCertificates {
+			if cert != nil {
+				state.PeerCertificates[i] = cert.Raw
+			}
+		}
+	}
+
+	if len(cs.VerifiedChains) > 0 {
+		state.VerifiedChains = make([][][]byte, len(cs.VerifiedChains))
+		for i, chain := range cs.VerifiedChains {
+			state.VerifiedChains[i] = make([][]byte, len(chain))
+			for j, cert := range chain {
+				if cert != nil {
+					state.VerifiedChains[i][j] = cert.Raw
+				}
+			}
+		}
+	}
+
+	return state
 }
 
-// Required to implement io.ReaderCloser
-func (b *bytesBufferCloser) Close() error {
-	return nil
+func (s *gobTLSState) toTLSConnectionState() (*tls.ConnectionState, error) {
+	if s == nil {
+		return nil, nil
+	}
+
+	cs := &tls.ConnectionState{
+		Version:                     s.Version,
+		HandshakeComplete:           s.HandshakeComplete,
+		DidResume:                   s.DidResume,
+		CipherSuite:                 s.CipherSuite,
+		CurveID:                     s.CurveID,
+		NegotiatedProtocol:          s.NegotiatedProtocol,
+		ServerName:                  s.ServerName,
+		SignedCertificateTimestamps: s.SignedCertificateTimestamps,
+		OCSPResponse:                s.OCSPResponse,
+		TLSUnique:                   s.TLSUnique,
+		ECHAccepted:                 s.ECHAccepted,
+		HelloRetryRequest:           s.HelloRetryRequest,
+	}
+
+	if len(s.PeerCertificates) > 0 {
+		cs.PeerCertificates = make([]*x509.Certificate, len(s.PeerCertificates))
+		for i, raw := range s.PeerCertificates {
+			if len(raw) == 0 {
+				continue
+			}
+			cert, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return nil, fmt.Errorf("dvr: parse peer certificate: %w", err)
+			}
+			cs.PeerCertificates[i] = cert
+		}
+	}
+
+	if len(s.VerifiedChains) > 0 {
+		cs.VerifiedChains = make([][]*x509.Certificate, len(s.VerifiedChains))
+		for i, chain := range s.VerifiedChains {
+			cs.VerifiedChains[i] = make([]*x509.Certificate, len(chain))
+			for j, raw := range chain {
+				if len(raw) == 0 {
+					continue
+				}
+				cert, err := x509.ParseCertificate(raw)
+				if err != nil {
+					return nil, fmt.Errorf("dvr: parse verified chain certificate: %w", err)
+				}
+				cs.VerifiedChains[i][j] = cert
+			}
+		}
+	}
+
+	return cs, nil
 }
 
-//
-// Request wrapper
-//
-
-// This is a gob encodable version of http.Request. It removes the possibility
-// that a private field can be seen and therefor return an error.
 type gobRequest struct {
 	Method           string
 	URL              string
@@ -197,46 +318,42 @@ type gobRequest struct {
 	Trailer          http.Header
 	RemoteAddr       string
 	RequestURI       string
-	TLS              *tls.ConnectionState
+	TLS              *gobTLSState
 
-	// The request body and err returned when reading it.
 	Body  []byte
 	Error gobError
 }
 
-// This takes a Request object and returns a gob compatible gobRequest object.
 func newGobRequest(req *http.Request) *gobRequest {
 	if req == nil {
 		return nil
 	}
 
-	r := new(gobRequest)
-	r.Method = req.Method
-	r.URL = req.URL.String()
-	r.Proto = req.Proto
-	r.ProtoMajor = req.ProtoMajor
-	r.ProtoMinor = req.ProtoMinor
-	r.Header = req.Header
-	r.ContentLength = req.ContentLength
-	r.TransferEncoding = req.TransferEncoding
-	r.Close = req.Close
-	r.Host = req.Host
-	r.Form = req.Form
-	r.PostForm = req.PostForm
-	r.Trailer = req.Trailer
-	r.RemoteAddr = req.RemoteAddr
-	r.RequestURI = req.RequestURI
-	newGobRequestVS(req, r)
+	var rawURL string
+	if req.URL != nil {
+		rawURL = req.URL.String()
+	}
 
-	return r
+	return &gobRequest{
+		Method:           req.Method,
+		URL:              rawURL,
+		Proto:            req.Proto,
+		ProtoMajor:       req.ProtoMajor,
+		ProtoMinor:       req.ProtoMinor,
+		Header:           req.Header,
+		ContentLength:    req.ContentLength,
+		TransferEncoding: req.TransferEncoding,
+		Close:            req.Close,
+		Host:             req.Host,
+		Form:             req.Form,
+		PostForm:         req.PostForm,
+		Trailer:          req.Trailer,
+		RemoteAddr:       req.RemoteAddr,
+		RequestURI:       req.RequestURI,
+		TLS:              newGobTLSState(req.TLS),
+	}
 }
 
-//
-// Response wrapper
-//
-
-// This object wraps an http.Response object in order to make it possible to
-// gob encode it.
 type gobResponse struct {
 	Status           string
 	StatusCode       int
@@ -247,109 +364,106 @@ type gobResponse struct {
 	ContentLength    int64
 	TransferEncoding []string
 	Close            bool
+	Uncompressed     bool
 	Trailer          http.Header
-	TLS              *tls.ConnectionState
+	TLS              *gobTLSState
 
-	// The response body and err returned when reading it.
 	Body  []byte
 	Error gobError
 }
 
-// This takes a Response object and returns a gob compatible gobResponse object.
 func newGobResponse(resp *http.Response) *gobResponse {
 	if resp == nil {
 		return nil
 	}
 
-	r := new(gobResponse)
-	r.Status = resp.Status
-	r.StatusCode = resp.StatusCode
-	r.Proto = resp.Proto
-	r.ProtoMajor = resp.ProtoMajor
-	r.ProtoMinor = resp.ProtoMinor
-	r.Header = resp.Header
-	r.ContentLength = resp.ContentLength
-	r.TransferEncoding = resp.TransferEncoding
-	r.Close = resp.Close
-	r.Trailer = resp.Trailer
-	newGobResponseVS(resp, r)
-
-	return r
+	return &gobResponse{
+		Status:           resp.Status,
+		StatusCode:       resp.StatusCode,
+		Proto:            resp.Proto,
+		ProtoMajor:       resp.ProtoMajor,
+		ProtoMinor:       resp.ProtoMinor,
+		Header:           resp.Header,
+		ContentLength:    resp.ContentLength,
+		TransferEncoding: resp.TransferEncoding,
+		Close:            resp.Close,
+		Uncompressed:     resp.Uncompressed,
+		Trailer:          resp.Trailer,
+		TLS:              newGobTLSState(resp.TLS),
+	}
 }
 
-//
-// gobQuery wrapper
-//
-
-// This structure is used when dumping data into the recorded query file.
-// It contains the request as well as the response and error so that the
-// return can exactly match the recorded return.
 type gobQuery struct {
-	// This stores the information from the Request object.
-	Request *gobRequest
-
-	// This stores the information from the Response object.
+	Request  *gobRequest
 	Response *gobResponse
-
-	// This stores the error returned from the RoundTrip call.
-	Error gobError
+	Error    gobError
 }
 
-// This call converts a gobQuery object into a RequestResponse object for use
-// with replaying requests.
-func (g *gobQuery) RequestResponse() *RequestResponse {
-	var err error
-	rr := new(RequestResponse)
+func (g *gobQuery) toRequestResponse() (*RequestResponse, error) {
+	rr := &RequestResponse{
+		Error: g.Error.Error,
+	}
 
-	// Start by converting the gobRequest object to a Request object..
 	if g.Request != nil {
-		rr.Request = new(http.Request)
-		rr.Request.Method = g.Request.Method
-		rr.Request.URL, err = url.Parse(g.Request.URL)
-		panicIfError(err)
-		rr.Request.Proto = g.Request.Proto
-		rr.Request.ProtoMajor = g.Request.ProtoMajor
-		rr.Request.ProtoMinor = g.Request.ProtoMinor
-		rr.Request.Header = g.Request.Header
-		rr.Request.ContentLength = g.Request.ContentLength
-		rr.Request.TransferEncoding = g.Request.TransferEncoding
-		rr.Request.Close = g.Request.Close
-		rr.Request.Host = g.Request.Host
-		rr.Request.Form = g.Request.Form
-		rr.Request.PostForm = g.Request.PostForm
-		rr.Request.Trailer = g.Request.Trailer
-		rr.Request.RemoteAddr = g.Request.RemoteAddr
-		rr.Request.RequestURI = g.Request.RequestURI
+		var parsedURL *url.URL
+		if g.Request.URL != "" {
+			var err error
+			parsedURL, err = url.Parse(g.Request.URL)
+			if err != nil {
+				return nil, fmt.Errorf("dvr: parse recorded request URL: %w", err)
+			}
+		}
 
-		// Next we deal with the body.
+		tlsState, err := g.Request.TLS.toTLSConnectionState()
+		if err != nil {
+			return nil, err
+		}
+
+		rr.Request = &http.Request{
+			Method:           g.Request.Method,
+			URL:              parsedURL,
+			Proto:            g.Request.Proto,
+			ProtoMajor:       g.Request.ProtoMajor,
+			ProtoMinor:       g.Request.ProtoMinor,
+			Header:           g.Request.Header,
+			ContentLength:    g.Request.ContentLength,
+			TransferEncoding: g.Request.TransferEncoding,
+			Close:            g.Request.Close,
+			Host:             g.Request.Host,
+			Form:             g.Request.Form,
+			PostForm:         g.Request.PostForm,
+			Trailer:          g.Request.Trailer,
+			RemoteAddr:       g.Request.RemoteAddr,
+			RequestURI:       g.Request.RequestURI,
+			TLS:              tlsState,
+		}
 		rr.RequestBody = g.Request.Body
 		rr.RequestBodyError = g.Request.Error.Error
 	}
 
-	// Next we deal with the gobResponse object.
 	if g.Response != nil {
-		rr.Response = new(http.Response)
-		rr.Response.Status = g.Response.Status
-		rr.Response.StatusCode = g.Response.StatusCode
-		rr.Response.Proto = g.Response.Proto
-		rr.Response.ProtoMajor = g.Response.ProtoMajor
-		rr.Response.ProtoMinor = g.Response.ProtoMinor
-		rr.Response.Header = g.Response.Header
-		rr.Response.ContentLength = g.Response.ContentLength
-		rr.Response.TransferEncoding = g.Response.TransferEncoding
-		rr.Response.Close = g.Response.Close
-		rr.Response.Trailer = g.Response.Trailer
+		tlsState, err := g.Response.TLS.toTLSConnectionState()
+		if err != nil {
+			return nil, err
+		}
 
-		// Next we deal with the body.
+		rr.Response = &http.Response{
+			Status:           g.Response.Status,
+			StatusCode:       g.Response.StatusCode,
+			Proto:            g.Response.Proto,
+			ProtoMajor:       g.Response.ProtoMajor,
+			ProtoMinor:       g.Response.ProtoMinor,
+			Header:           g.Response.Header,
+			ContentLength:    g.Response.ContentLength,
+			TransferEncoding: g.Response.TransferEncoding,
+			Close:            g.Response.Close,
+			Uncompressed:     g.Response.Uncompressed,
+			Trailer:          g.Response.Trailer,
+			TLS:              tlsState,
+		}
 		rr.ResponseBody = g.Response.Body
 		rr.ResponseBodyError = g.Response.Error.Error
 	}
 
-	// Do golang version specific work.
-	g.requestResponseVS(rr)
-
-	// Copy the error
-	rr.Error = g.Error.Error
-
-	return rr
+	return rr, nil
 }

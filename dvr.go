@@ -16,225 +16,368 @@ package dvr
 
 import (
 	"archive/tar"
-	"flag"
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
-	"os/exec"
+	"slices"
+	"strings"
 	"sync"
+	"testing"
 )
+
+// DefaultArchiveFile is the default path used when recording or replaying
+// HTTP traffic if no explicit file path is specified.
+const DefaultArchiveFile = "testdata/archive.dvr"
+
+// Mode determines how a [Recorder] handles outgoing HTTP requests.
+type Mode int
+
+const (
+	// ModePassthrough forwards all requests directly to the underlying transport
+	// without recording or replaying them.
+	ModePassthrough Mode = iota
+
+	// ModeRecord forwards requests to the underlying transport and persists each
+	// request/response exchange to the configured archive file.
+	ModeRecord
+
+	// ModeReplay matches incoming requests against a previously recorded archive
+	// file and returns the recorded responses without network access.
+	ModeReplay
+)
+
+// String returns a human-readable name for the mode.
+func (m Mode) String() string {
+	switch m {
+	case ModePassthrough:
+		return "passthrough"
+	case ModeRecord:
+		return "record"
+	case ModeReplay:
+		return "replay"
+	default:
+		return fmt.Sprintf("Mode(%d)", int(m))
+	}
+}
 
 var (
-	// Set to true if we want to capture and save the various HTTP
-	// calls the are made during the testing cycle.
-	record bool
+	// ErrNoMatch indicates that no recorded request in the archive matched an
+	// incoming request during replay.
+	ErrNoMatch = errors.New("dvr: no matching recorded request")
 
-	// Set to true if we want to read the recordFile requests and serve
-	// them rather than allowing requests to be made to the real internet
-	// service.
-	replay bool
+	// ErrUnsupportedVersion indicates that an archive file has an unknown or
+	// unsupported format version.
+	ErrUnsupportedVersion = errors.New("dvr: unsupported archive version")
 
-	// If this is true then the user forced the client into pass through
-	// mode which disables record and replay.
-	passThrough bool
-
-	// This is the file that test recordings will be saved into.
-	fileName string
-
-	// If this is set to true then -dvr.replay becomes default if not
-	// other flags are provided. If this is falls then the default will be
-	// to pass queries through without recording or replaying them
-	DefaultReplay bool
-
-	// On the first call to the RoundTripper we ensure that everything is
-	// setup and loaded. We only do this once, and only on the very first call.
-	isSetup sync.Once
-
-	// The file descriptor of the record file. This will exist in either
-	// record or replay mode.
-	fd *os.File
-
-	// This is the tar.Writer that is used for writing the request gob's
-	// into the file. We also keep a mutex to ensure that we only write
-	// one request at a time to the file.
-	writer      *tar.Writer
-	writerLock  sync.Mutex
-	writerCount int
-	writerCmd   *exec.Cmd
-
-	// This is the list of object read from the gob file.
-	requestList []*RequestResponse
-	requestLock sync.Mutex
+	// ErrClosed indicates that an operation was attempted on a closed [Recorder].
+	ErrClosed = errors.New("dvr: recorder is closed")
 )
 
-// This is the round tripper that replaced the default round tripper in the
-// net/http library. Its stored here so it can be retrieved if lost.
-var DefaultRoundTripper http.RoundTripper
+const maxNoMatchBodyPreview = 512
 
-// This is the round tripper that we overwrote in net/http. It is preserved
-// here in case it needs be recovered.
-var OriginalDefaultTransport http.RoundTripper
-
-// Initialize the flags.
-func init() {
-	flag.BoolVar(&record, "dvr.record", false,
-		"Record HTTP calls into -dvr.record_file for use later.")
-	flag.BoolVar(&replay, "dvr.replay", false,
-		"Replay HTTP calls from -svr.record_file.")
-	flag.BoolVar(&passThrough, "dvr.passthrough", false,
-		"Allow queries to pass through without being recorded or replayed.")
-	flag.StringVar(&fileName, "dvr.file",
-		"testdata/archive.dvr",
-		"The file that stores recorded HTTP calls.")
-
-	// Replace DefaultTransport!
-	OriginalDefaultTransport = http.DefaultTransport
-	DefaultRoundTripper = NewRoundTripper(http.DefaultTransport)
-	http.DefaultTransport = DefaultRoundTripper
+// NoMatchError is returned by [Recorder.RoundTrip] during [ModeReplay] when an
+// incoming request does not match any unconsumed entry in the archive.
+type NoMatchError struct {
+	Method  string
+	URL     string
+	Header  http.Header
+	Trailer http.Header
+	Body    []byte
 }
 
-// Returns booleans representing the current running mode. If none of the
-// returns are true then the library is in pass through mode.
-func mode() (rec bool, rep bool) {
-	switch {
-	case record:
-		return true, false
-	case replay:
-		return false, true
-	case passThrough:
-		return false, false
-	case DefaultReplay:
-		return false, true
-	default:
-		return false, false
+// Error returns a formatted diagnostic describing the unmatched request.
+func (e *NoMatchError) Error() string {
+	var b strings.Builder
+	b.WriteString("dvr: no matching recorded request\n\nDetails of the unmatched request:\n")
+	fmt.Fprintf(&b, "Method: %s\n", e.Method)
+	fmt.Fprintf(&b, "URL: %s\n", e.URL)
+
+	if len(e.Header) > 0 {
+		b.WriteString("Headers:\n")
+		for _, key := range slices.Sorted(maps.Keys(e.Header)) {
+			fmt.Fprintf(&b, "    %s: %s\n", key, strings.Join(e.Header[key], ", "))
+		}
 	}
-}
 
-// Returns true if the DVR library is in recording mode.
-func IsRecording() bool {
-	b, _ := mode()
-	return b
-}
-
-// Returns true if the DVR library is in pass through mode.
-func IsPassingThrough() bool {
-	a, b := mode()
-	return !a && !b
-}
-
-// Returns true if the DVR library is in replay mode.
-func IsReplay() bool {
-	_, b := mode()
-	return b
-}
-
-// A simple error type that wraps all library panics.
-type dvrFailure struct {
-	Err error
-}
-
-// Return the underlying error's message
-func (d *dvrFailure) Error() string {
-	return d.Err.Error()
-}
-
-// This is the channel that the panic routine should be writing to for errors.
-// Basically this allows us to mute the error during tests.
-var panicOutput io.Writer = os.Stdout
-
-// This function is used when the library can not continue safely. The idea
-// is that the user has requested a specific configuration (say replaying
-// requests) and that is not possible. We have no way of reporting this
-// back to the user in a meaningful way since returning an error might only
-// fail a specific test (or worse, cause the test to pass when it shouldn't
-// since it expects an error). As such we panic with a verify specific header
-// message to let the user know that something has gone wrong.
-//
-// If err is nil this will do nothing, otherwise it will panic with a
-// error message to the user knows what is happening.
-func panicIfError(err error) {
-	if err == nil {
-		return
+	if len(e.Trailer) > 0 {
+		b.WriteString("Trailers:\n")
+		for _, key := range slices.Sorted(maps.Keys(e.Trailer)) {
+			fmt.Fprintf(&b, "    %s: %s\n", key, strings.Join(e.Trailer[key], ", "))
+		}
 	}
-	fmt.Fprintf(panicOutput, ""+
-		"An error was encounteded in the DVR library.\n"+
-		"This error will cause potentially inconsistent results from tests\n"+
-		"so the entire testing process will be terminated (sorry).\n"+
-		"Please correct the error in the message below and re-run the test.\n"+
-		"If this is an internal issue please feel free to file a bug report\n"+
-		"with the dvr developers at: https://github.com/orchestrate-io/dvr\n\n"+
-		"The error encountered is:\n%s\n", err)
-	panic(&dvrFailure{Err: err})
-}
 
-// This is the roundTripper that will be installed as part of the HTTP
-// client interception routines. This is an implementation of
-// net/http.RoundTripper.
-type roundTripper struct {
-	// This is the real http.RoundTripper interface that will be used
-	// when not in replay mode. All calls will be passed through to this
-	// handler.
-	realRoundTripper http.RoundTripper
-}
-
-// This creates a new RoundTripper object with the given RoundTripper object
-// as its fall back (for pass through and recording modes).
-func NewRoundTripper(fallback http.RoundTripper) http.RoundTripper {
-	r := new(roundTripper)
-	r.realRoundTripper = fallback
-	return r
-}
-
-// This is the call that is expected to actually perform the HTTP request.
-// In our case we can either pass the request through, record it, or return
-// the data from a request in the recorded file.
-func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	rec, rep := mode()
-	switch {
-	case rec:
-		return r.record(req)
-	case rep:
-		return r.replay(req)
-	default:
-		return r.realRoundTripper.RoundTrip(req)
+	if len(e.Body) > 0 {
+		b.WriteString("Body:\n")
+		body := e.Body
+		truncated := false
+		if len(body) > maxNoMatchBodyPreview {
+			body = body[:maxNoMatchBodyPreview]
+			truncated = true
+		}
+		b.Write(body)
+		if truncated {
+			b.WriteString("... (content truncated by dvr)")
+		}
 	}
+
+	return strings.TrimRight(b.String(), "\n")
 }
 
-// Interface to match http.Transport's CancelRequest method.
-type httpCancelRequest interface {
-	CancelRequest(*http.Request)
+// Unwrap returns [ErrNoMatch] so callers can match with [errors.Is].
+func (e *NoMatchError) Unwrap() error {
+	return ErrNoMatch
 }
 
-// This call will cancel an in flight request.. It does nothing in replay
-// mode and is passed through if possible in record mode.
-func (r *roundTripper) CancelRequest(req *http.Request) {
-	if c, ok := r.realRoundTripper.(httpCancelRequest); ok {
-		c.CancelRequest(req)
-	}
-}
-
-// This structure stores information about a Request/Response pairing. It is
-// intended to keep the data together for use when matching and such.
+// RequestResponse stores a recorded HTTP request/response exchange for use by
+// [MatchFunc] and [ObfuscateFunc].
 type RequestResponse struct {
-	// This is the Request object that was passed in to the RoundTripper
-	// call. This object will have it's Body field set to nil, with the body
-	// being represented in the byte array 'RequestBody'. The error (if any)
-	// returned when reading from Body is stored in RequestBodyError.
+	// Request is the HTTP request passed to RoundTrip. Its Body field is nil;
+	// the captured bytes and any read error are stored in RequestBody and
+	// RequestBodyError.
 	Request          *http.Request
 	RequestBody      []byte
 	RequestBodyError error
 
-	// This is the Response object that was returned to the caller. Note that
-	// Body in this field is saved in the ResponseBody field, and the error
-	// returned from the server is stored in ResponseBodyError.
+	// Response is the HTTP response returned by the server. Its Body field is
+	// nil; the captured bytes and any read error are stored in ResponseBody and
+	// ResponseBodyError.
 	Response          *http.Response
 	ResponseBody      []byte
 	ResponseBodyError error
 
-	// This is the error returned from the RountTrip() call.
+	// Error is the error returned by the underlying RoundTrip call.
 	Error error
 
-	// This stores any user data that is necessary for the Matcher() function.
-	UserData interface{}
+	// UserData holds arbitrary state attached by a [MatchFunc] (for example,
+	// marking an entry as already consumed).
+	UserData any
+}
+
+// MatchFunc reports whether an incoming request (left) matches a recorded
+// entry from the archive (right). Implementations should not mutate either
+// argument except for right.UserData. During matching, left's Response* fields
+// are unset.
+type MatchFunc func(left, right *RequestResponse) bool
+
+// ObfuscateFunc mutates a deep copy of a [RequestResponse] before it is written
+// to an archive file during [ModeRecord], leaving the live HTTP request and
+// response returned to the caller untouched.
+type ObfuscateFunc func(*RequestResponse)
+
+type config struct {
+	mode       Mode
+	file       string
+	transport  http.RoundTripper
+	matcher    MatchFunc
+	obfuscator ObfuscateFunc
+}
+
+// Option configures a [Recorder] created with [New] or [NewForTest].
+type Option func(*config)
+
+// WithMode sets the operating [Mode] of the recorder.
+func WithMode(mode Mode) Option {
+	return func(c *config) {
+		c.mode = mode
+	}
+}
+
+// WithFile sets the archive file path used for [ModeRecord] and [ModeReplay].
+func WithFile(path string) Option {
+	return func(c *config) {
+		c.file = path
+	}
+}
+
+// WithTransport sets the underlying [http.RoundTripper] used in
+// [ModePassthrough] and [ModeRecord]. Defaults to [http.DefaultTransport].
+func WithTransport(rt http.RoundTripper) Option {
+	return func(c *config) {
+		c.transport = rt
+	}
+}
+
+// WithMatcher sets the [MatchFunc] used to match incoming requests against
+// recorded entries during [ModeReplay]. Defaults to [DefaultMatcher].
+func WithMatcher(fn MatchFunc) Option {
+	return func(c *config) {
+		c.matcher = fn
+	}
+}
+
+// WithObfuscator sets an [ObfuscateFunc] called on a copy of each exchange
+// before it is saved during [ModeRecord].
+func WithObfuscator(fn ObfuscateFunc) Option {
+	return func(c *config) {
+		c.obfuscator = fn
+	}
+}
+
+// Recorder intercepts HTTP requests via [http.RoundTripper] to pass through,
+// record, or replay HTTP traffic.
+type Recorder struct {
+	mode       Mode
+	filePath   string
+	transport  http.RoundTripper
+	matcher    MatchFunc
+	obfuscator ObfuscateFunc
+
+	mu          sync.Mutex
+	closed      bool
+	file        *os.File
+	gzipWriter  *gzip.Writer
+	tarWriter   *tar.Writer
+	writerCount int
+	entries     []*RequestResponse
+}
+
+var (
+	_ http.RoundTripper = (*Recorder)(nil)
+	_ io.Closer         = (*Recorder)(nil)
+)
+
+// New creates and initializes a [Recorder] with the provided options.
+//
+// In [ModeRecord], New opens or creates the archive file immediately; callers
+// must invoke [Recorder.Close] to flush and finalize the archive.
+// In [ModeReplay], New loads and decodes the archive file into memory.
+func New(opts ...Option) (*Recorder, error) {
+	cfg := config{
+		mode:      ModePassthrough,
+		file:      DefaultArchiveFile,
+		transport: http.DefaultTransport,
+		matcher:   DefaultMatcher,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
+	switch cfg.mode {
+	case ModePassthrough, ModeRecord, ModeReplay:
+	default:
+		return nil, fmt.Errorf("dvr: invalid mode %d", cfg.mode)
+	}
+
+	if cfg.matcher == nil {
+		cfg.matcher = DefaultMatcher
+	}
+
+	if cfg.mode != ModeReplay && cfg.transport == nil {
+		cfg.transport = http.DefaultTransport
+		if cfg.transport == nil {
+			return nil, errors.New("dvr: transport must not be nil")
+		}
+	}
+
+	r := &Recorder{
+		mode:       cfg.mode,
+		filePath:   cfg.file,
+		transport:  cfg.transport,
+		matcher:    cfg.matcher,
+		obfuscator: cfg.obfuscator,
+	}
+
+	switch r.mode {
+	case ModeRecord:
+		if err := r.openForRecord(); err != nil {
+			return nil, err
+		}
+	case ModeReplay:
+		if err := r.loadForReplay(); err != nil {
+			return nil, err
+		}
+	}
+
+	return r, nil
+}
+
+// NewForTest creates a [Recorder] for use in a test and registers [Recorder.Close]
+// with [testing.TB.Cleanup]. Any initialization error fails the test immediately.
+func NewForTest(tb testing.TB, opts ...Option) *Recorder {
+	tb.Helper()
+	r, err := New(opts...)
+	if err != nil {
+		tb.Fatalf("dvr: failed to create recorder: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			tb.Errorf("dvr: failed to close recorder: %v", err)
+		}
+	})
+	return r
+}
+
+// Mode returns the [Mode] configured for this recorder.
+func (r *Recorder) Mode() Mode {
+	return r.mode
+}
+
+// Client returns a new [http.Client] configured to send requests through this
+// recorder.
+func (r *Recorder) Client() *http.Client {
+	return &http.Client{Transport: r}
+}
+
+// RoundTrip implements [http.RoundTripper] by passing through, recording, or
+// replaying the request according to the recorder's configured [Mode].
+func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, errors.New("dvr: request must not be nil")
+	}
+
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+
+	switch r.mode {
+	case ModeRecord:
+		return r.record(req)
+	case ModeReplay:
+		return r.replay(req)
+	default:
+		return r.transport.RoundTrip(req)
+	}
+}
+
+// Close flushes and closes any underlying archive writers and files. Close is
+// safe for concurrent use and is idempotent.
+func (r *Recorder) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+
+	var errs []error
+	if r.tarWriter != nil {
+		if err := r.tarWriter.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		r.tarWriter = nil
+	}
+	if r.gzipWriter != nil {
+		if err := r.gzipWriter.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		r.gzipWriter = nil
+	}
+	if r.file != nil {
+		if err := r.file.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		r.file = nil
+	}
+
+	return errors.Join(errs...)
 }

@@ -16,48 +16,27 @@ package dvr
 
 import (
 	"encoding/base64"
-	"fmt"
 	"net/url"
 )
 
-// This is the type used to store the values, but not the stack from the call
-// to BasicAuthObfuscator.
-type basicAuthObfuscator struct {
-	username string
-	password string
-}
-
-// This is the Obfuscator function attached to the above.
-func (b *basicAuthObfuscator) Obfuscator(rr *RequestResponse) {
-	// If the Authorization header is set then we need to replace it with
-	// the username/password given above.
-	if rr.Request.Header.Get("Authorization") != "" {
-		up := fmt.Sprintf("%s:%s", b.username, b.password)
-		value := "Basic " + base64.StdEncoding.EncodeToString([]byte(up))
-		rr.Request.Header.Del("Authorization")
-		rr.Request.Header.Set("Authorization", value)
-	}
-
-	// Next we check to see if the URL object contains a User value, if so
-	// then it will get replaced with one that has the username and
-	// password set to the replacement values.
-	if rr.Request.URL.User != nil {
-		if b.password == "" {
-			rr.Request.URL.User = url.User(b.username)
-		} else {
-			rr.Request.URL.User = url.UserPassword(
-				b.username, b.password)
+// BasicAuthObfuscator returns an [ObfuscateFunc] that replaces any HTTP Basic
+// Auth credentials in the Authorization header and URL userinfo with username
+// and password before the request is written to an archive.
+func BasicAuthObfuscator(username, password string) ObfuscateFunc {
+	authValue := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+	return func(rr *RequestResponse) {
+		if rr == nil || rr.Request == nil {
+			return
+		}
+		if rr.Request.Header != nil && rr.Request.Header.Get("Authorization") != "" {
+			rr.Request.Header.Set("Authorization", authValue)
+		}
+		if rr.Request.URL != nil && rr.Request.URL.User != nil {
+			if password == "" {
+				rr.Request.URL.User = url.User(username)
+			} else {
+				rr.Request.URL.User = url.UserPassword(username, password)
+			}
 		}
 	}
-}
-
-// This function call will return a function that can act as a Obfuscator
-// which removes any HTTP Basic Auth credential and replaces it with the
-// given arguments. The results of this call can be directly used with the
-// Obfuscator variable.
-func BasicAuthObfuscator(username, password string) func(*RequestResponse) {
-	return (&basicAuthObfuscator{
-		username: username,
-		password: password,
-	}).Obfuscator
 }

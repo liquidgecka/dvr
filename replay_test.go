@@ -15,150 +15,202 @@
 package dvr
 
 import (
+	"bytes"
+	"errors"
 	"net/http"
 	"net/url"
-	"sync"
+	"path/filepath"
 	"testing"
 
 	"github.com/liquidgecka/testlib"
 )
 
-func TestMatcher(t *testing.T) {
+func TestDefaultMatcher(t *testing.T) {
 	T := testlib.NewT(t)
 	defer T.Finish()
 
 	left := &RequestResponse{}
 	right := &RequestResponse{
 		Request: &http.Request{
-			Method: "GET",
+			Method: http.MethodGet,
 			URL: &url.URL{
 				Scheme:   "http",
 				Opaque:   "opaque",
 				User:     url.UserPassword("user", "password"),
 				Host:     "host",
 				Path:     "path",
+				RawPath:  "rawpath",
 				RawQuery: "raw",
 				Fragment: "fragment",
 			},
-			Header: http.Header(map[string][]string{
+			Header: http.Header{
 				"header1": []string{"value1", "value2"},
-			}),
-			Trailer: http.Header(map[string][]string{
+			},
+			Trailer: http.Header{
 				"header2": []string{"value3", "value4"},
-			}),
+			},
 		},
 		RequestBody: []byte("body"),
 	}
 
-	// Test 1: nil values (returns false
-	T.Equal(matcher(nil, nil), false)
-	T.Equal(matcher(left, right), false)
+	// Nil values.
+	T.Equal(DefaultMatcher(nil, nil), false)
+	T.Equal(DefaultMatcher(left, right), false)
 
-	// Test 2: nil url.
+	// Nil URL.
 	left.Request = &http.Request{}
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 
-	// Test 3: Different Schemes
+	// Different HTTP method.
 	left.Request = &http.Request{
-		URL: &url.URL{
-			Scheme: "NOT_GET",
-		},
+		Method: http.MethodPost,
+		URL:    &url.URL{Scheme: "http"},
 	}
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
+
+	// Empty method normalizes to GET.
+	left.Request.Method = ""
+
+	// Different Scheme.
+	left.Request.URL.Scheme = "https"
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.Scheme = right.Request.URL.Scheme
 
-	// Test 4: Different Opaque values.
+	// Different Opaque.
 	left.Request.URL.Opaque = "NOT_OPAQUE"
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.Opaque = right.Request.URL.Opaque
 
-	// Test 5: Different Host values.
+	// Different Host.
 	left.Request.URL.Host = "NOT_HOST"
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.Host = right.Request.URL.Host
 
-	// Test 6: Different Path values.
+	// Different Path.
 	left.Request.URL.Path = "NOT_PATH"
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.Path = right.Request.URL.Path
 
-	// Test 7: Different RawQuery values.
+	// Different RawPath.
+	left.Request.URL.RawPath = "NOT_RAW_PATH"
+	T.Equal(DefaultMatcher(left, right), false)
+	left.Request.URL.RawPath = right.Request.URL.RawPath
+
+	// Different RawQuery.
 	left.Request.URL.RawQuery = "NOT_RAW_QUERY"
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.RawQuery = right.Request.URL.RawQuery
 
-	// Test 8: Different Fragment values.
+	// Different Fragment.
 	left.Request.URL.Fragment = "NOT_FRAGMENT"
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.URL.Fragment = right.Request.URL.Fragment
 
-	// Test 9: Left URL.User == nil
-	T.Equal(matcher(left, right), false)
+	// Left URL.User == nil.
+	T.Equal(DefaultMatcher(left, right), false)
 
-	// Test 10: Right URL.User = nil
+	// Right URL.User == nil.
 	left.Request.URL.User = right.Request.URL.User
 	right.Request.URL.User = nil
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 
-	// Test 11: URL.User.String() is different.
+	// Different URL.User.
 	right.Request.URL.User = url.UserPassword("not_user", "not_password")
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	right.Request.URL.User = left.Request.URL.User
 
-	// Test 12: RequestBody values differ.
+	// Different RequestBody.
 	left.RequestBody = []byte("NOT_THE_SAME")
-	T.Equal(matcher(left, right), false)
+	T.Equal(DefaultMatcher(left, right), false)
 	left.RequestBody = right.RequestBody
 
-	// Test 13: Headers are different.
-	left.Request.Header = http.Header(map[string][]string{
+	// Different Headers.
+	left.Request.Header = http.Header{
 		"header1": []string{"value1", "value2_XXX"},
-	})
-	T.Equal(matcher(left, right), false)
+	}
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.Header = right.Request.Header
 
-	// Test 14: Trailers are different.
-	left.Request.Trailer = http.Header(map[string][]string{
+	// Different Trailers.
+	left.Request.Trailer = http.Header{
 		"header2": []string{"value1", "value2_XXX"},
-	})
-	T.Equal(matcher(left, right), false)
+	}
+	T.Equal(DefaultMatcher(left, right), false)
 	left.Request.Trailer = right.Request.Trailer
 
-	// Test 15: Successful match.
-	T.Equal(matcher(left, right), true)
+	// Successful match consumes right entry.
+	T.Equal(DefaultMatcher(left, right), true)
 
-	// Test 16: Second try fails.
-	T.Equal(matcher(left, right), false)
+	// Second attempt against already-consumed entry fails.
+	T.Equal(DefaultMatcher(left, right), false)
+
+	// Empty header map matches nil header map.
+	leftEmpty := &RequestResponse{
+		Request: &http.Request{
+			Method: http.MethodGet,
+			URL:    &url.URL{Scheme: "http", Host: "example.com"},
+			Header: http.Header{},
+		},
+	}
+	rightNil := &RequestResponse{
+		Request: &http.Request{
+			Method: http.MethodGet,
+			URL:    &url.URL{Scheme: "http", Host: "example.com"},
+		},
+	}
+	T.Equal(DefaultMatcher(leftEmpty, rightNil), true)
 }
 
 func TestBadVersion(t *testing.T) {
 	T := testlib.NewT(t)
 	defer T.Finish()
 
-	fd := T.TempFile()
-	isSetup = sync.Once{}
-	record = false
-	replay = true
-	passThrough = false
-	DefaultReplay = false
-	fileName = fd.Name()
+	archivePath := T.WriteTempFile("\x00\x00\x00\x00")
+	_, err := New(
+		WithMode(ModeReplay),
+		WithFile(archivePath),
+	)
+	T.ExpectError(err)
+	T.Equal(errors.Is(err, ErrUnsupportedVersion), true)
 
-	// Write all zeros to the temp file which will be version 0.
-	_, err := fd.Write([]byte{0, 0, 0, 0})
-	T.ExpectSuccess(err)
-	T.ExpectSuccess(fd.Close())
+	// Truncated header returns an error too.
+	shortPath := filepath.Join(T.TempDir(), "short.dvr")
+	shortFile := T.WriteTempFile("\x00")
+	_ = shortPath
+	_, err = New(
+		WithMode(ModeReplay),
+		WithFile(shortFile),
+	)
+	T.ExpectError(err)
+}
 
-	// Now check to see if the setup function fails for the right reasons.
-	defer func() {
-		err := recover()
-		if err == nil {
-			T.Fatalf("Expected panic not returned.")
-		} else if err2, ok := err.(error); !ok {
-			T.Fatalf("Unknown panic return: %#v\n", err)
-		} else {
-			T.ExpectErrorMessage(err2, "Unknown version: 0")
-		}
-	}()
-	rt := roundTripper{}
-	rt.replaySetup()
+func TestNoMatchError(t *testing.T) {
+	T := testlib.NewT(t)
+	defer T.Finish()
+
+	err := &NoMatchError{
+		Method: http.MethodPost,
+		URL:    "http://example.com/test",
+		Header: http.Header{
+			"Z-Header": []string{"z"},
+			"A-Header": []string{"a1", "a2"},
+		},
+		Trailer: http.Header{
+			"X-Trailer": []string{"t"},
+		},
+		Body: []byte("short body"),
+	}
+	T.Equal(errors.Is(err, ErrNoMatch), true)
+	T.ExpectErrorMessage(err, "Method: POST")
+	T.ExpectErrorMessage(err, "URL: http://example.com/test")
+	T.ExpectErrorMessage(err, "A-Header: a1, a2\n    Z-Header: z")
+	T.ExpectErrorMessage(err, "X-Trailer: t")
+	T.ExpectErrorMessage(err, "Body:\nshort body")
+
+	longErr := &NoMatchError{
+		Method: http.MethodPost,
+		URL:    "http://example.com/long",
+		Body:   bytes.Repeat([]byte("A"), 600),
+	}
+	T.ExpectErrorMessage(longErr, "... (content truncated by dvr)")
 }

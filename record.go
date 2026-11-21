@@ -17,159 +17,149 @@ package dvr
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strconv"
 )
 
-// If this value is anything other than nil it will be called on a copy
-// of the passed in *http.Request and a copy of the returned
-// *http.Response object. Any mutations to these objects will be stored in the
-// archive, but NOT be altered in the recording unit test. The intention of
-// this function is to allow obfuscation of data you do not want recorded.
-//
-// An example usage of this function is to change the password used to
-// authenticate against a web service in order to allow any user to
-// run the test. See the "RequestObfuscation" example for details.
-var Obfuscator func(*RequestResponse)
-
-// This function setups up the rountTripper in recording mode. This will open
-// the output file as a zip stream so each follow up call can write an
-// individual call to the output.
-func (r *roundTripper) recordSetup() {
-	// Open the gzip file.
-	gzipFD, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-		os.FileMode(0755))
-	panicIfError(err)
-
-	// Write the current version to the file as a 32 bit word.
-	version := uint32(1)
-	err = binary.Write(gzipFD, binary.BigEndian, version)
-	panicIfError(err)
-
-	// Create a pipe that we can use to talk to the child process.
-	gzipReader, gzipWriter, err := os.Pipe()
-	panicIfError(err)
-
-	// Start the gzipper command.
-	writerCmd = exec.Command(os.Args[0], InterceptorToken)
-	writerCmd.Stdout = gzipFD
-	writerCmd.Stdin = gzipReader
-	panicIfError(writerCmd.Start())
-
-	// Create the new zip writer that will store our results.
-	fd = gzipWriter
-	writer = tar.NewWriter(gzipWriter)
-}
-
-// This function is called if the testing library is in recording mode.
-// In recording mode we will automatically catch the data from all HTTP
-// requests and save them so they can be replayed later.
-func (r *roundTripper) record(req *http.Request) (*http.Response, error) {
-	// Ensure that recording is setup.
-	isSetup.Do(r.recordSetup)
-
-	// The structure that saves all of our transmitted data.
-	q := &gobQuery{}
-	q.Request = newGobRequest(req)
-
-	if req.Body != nil {
-		// Read the body into a buffer for us to save.
-		buffer := &bytes.Buffer{}
-		_, q.Request.Error.Error = io.Copy(buffer, req.Body)
-		q.Request.Body = buffer.Bytes()
-		req.Body = &bodyWriter{
-			offset: 0,
-			data:   q.Request.Body,
-			err:    q.Request.Error.Error,
+func (r *Recorder) openForRecord() error {
+	if dir := filepath.Dir(r.filePath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("dvr: create archive directory: %w", err)
 		}
 	}
 
-	// Use the underlying round tripper to actually complete the request.
-	resp, realErr := r.realRoundTripper.RoundTrip(req)
+	f, err := os.OpenFile(r.filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("dvr: open archive for writing: %w", err)
+	}
 
-	// Save the data we were returned.
+	if err := binary.Write(f, binary.BigEndian, archiveVersion); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("dvr: write archive version: %w", err)
+	}
+
+	gz, err := gzip.NewWriterLevel(f, gzip.BestCompression)
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("dvr: create gzip writer: %w", err)
+	}
+
+	r.file = f
+	r.gzipWriter = gz
+	r.tarWriter = tar.NewWriter(gz)
+	return nil
+}
+
+func (r *Recorder) record(req *http.Request) (*http.Response, error) {
+	q := &gobQuery{
+		Request: newGobRequest(req),
+	}
+
+	outReq := req.Clone(req.Context())
+	if req.Body != nil {
+		var reqBuf bytes.Buffer
+		_, reqBodyErr := io.Copy(&reqBuf, req.Body)
+		_ = req.Body.Close()
+
+		q.Request.Body = reqBuf.Bytes()
+		q.Request.Error.Error = reqBodyErr
+
+		outReq.Body = &bodyReader{
+			data: q.Request.Body,
+			err:  reqBodyErr,
+		}
+	}
+
+	resp, realErr := r.transport.RoundTrip(outReq)
+	if resp != nil && (resp.Request == nil || resp.Request == outReq) {
+		resp.Request = req
+	}
 	q.Error.Error = realErr
 	q.Response = newGobResponse(resp)
 
-	// Encode the body if necessary.
 	if resp != nil && resp.Body != nil {
-		buffer := &bytes.Buffer{}
-		_, q.Response.Error.Error = io.Copy(buffer, resp.Body)
-		q.Response.Body = buffer.Bytes()
-		resp.Body = &bodyWriter{
-			offset: 0,
-			data:   q.Response.Body,
-			err:    q.Response.Error.Error,
+		var respBuf bytes.Buffer
+		_, respBodyErr := io.Copy(&respBuf, resp.Body)
+		_ = resp.Body.Close()
+
+		q.Response.Body = respBuf.Bytes()
+		q.Response.Error.Error = respBodyErr
+
+		resp.Body = &bodyReader{
+			data: q.Response.Body,
+			err:  respBodyErr,
 		}
 	}
 
-	// Gob encode the request into a byte buffer so that we know the size.
-	buffer := &bytes.Buffer{}
-	encoder := gob.NewEncoder(buffer)
-	panicIfError(encoder.Encode(q))
-
-	// If an Obfuscator is present then we need to do a bunch of extra work.
-	f := Obfuscator
-	if f != nil {
-		// First we decode the encoded object back over its self. This allows
-		// us to know that we have copies of all data, so mutation won't impact
-		// the Request or Response we return from this function.
-		decoder := gob.NewDecoder(buffer)
-		panicIfError(decoder.Decode(q))
-
-		// Convert this to a RequestResponse object, then allow the Obfuscator
-		// to mutate it in what ever way it sees fit.
-		rr := q.RequestResponse()
-		f(rr)
-
-		// Now we need to re-encode the object back into a gobQuery.
-		q.Request = newGobRequest(rr.Request)
-		if q.Request != nil {
-			q.Request.Body = rr.RequestBody
-			q.Request.Error.Error = rr.RequestBodyError
-		}
-		q.Response = newGobResponse(rr.Response)
-		if q.Response != nil {
-			q.Response.Body = rr.ResponseBody
-			q.Response.Error.Error = rr.ResponseBodyError
-		}
-
-		// And lastly we encode this back into the buffer.
-		buffer = &bytes.Buffer{}
-		encoder := gob.NewEncoder(buffer)
-		panicIfError(encoder.Encode(q))
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(q); err != nil {
+		return resp, fmt.Errorf("dvr: encode recorded query: %w", err)
 	}
 
-	// Lock the writer output so that we don't have race conditions adding
-	// to the zip file.
-	writerLock.Lock()
-	defer writerLock.Unlock()
+	if r.obfuscator != nil {
+		var qCopy gobQuery
+		if err := gob.NewDecoder(&buf).Decode(&qCopy); err != nil {
+			return resp, fmt.Errorf("dvr: decode query for obfuscation: %w", err)
+		}
 
-	// Add a "Header" for the nea request. Headers are functionally virtual
-	// files in the tar stream.
+		rr, err := qCopy.toRequestResponse()
+		if err != nil {
+			return resp, err
+		}
+		r.obfuscator(rr)
+
+		qObf := &gobQuery{
+			Request:  newGobRequest(rr.Request),
+			Response: newGobResponse(rr.Response),
+			Error:    gobError{Error: rr.Error},
+		}
+		if qObf.Request != nil {
+			qObf.Request.Body = rr.RequestBody
+			qObf.Request.Error.Error = rr.RequestBodyError
+		}
+		if qObf.Response != nil {
+			qObf.Response.Body = rr.ResponseBody
+			qObf.Response.Error.Error = rr.ResponseBodyError
+		}
+
+		var obfBuf bytes.Buffer
+		if err := gob.NewEncoder(&obfBuf).Encode(qObf); err != nil {
+			return resp, fmt.Errorf("dvr: encode obfuscated query: %w", err)
+		}
+		buf = obfBuf
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil, ErrClosed
+	}
+
 	header := &tar.Header{
-		Name: fmt.Sprintf("%d", writerCount),
-		Size: int64(buffer.Len()),
+		Name:     strconv.Itoa(r.writerCount),
+		Mode:     0o600,
+		Size:     int64(buf.Len()),
+		Typeflag: tar.TypeReg,
 	}
-	writerCount = writerCount + 1
-	panicIfError(writer.WriteHeader(header))
+	r.writerCount++
 
-	// Write the buffer into the tar stream.
-	_, err := io.Copy(writer, buffer)
-	panicIfError(err)
+	if err := r.tarWriter.WriteHeader(header); err != nil {
+		return resp, fmt.Errorf("dvr: write tar header: %w", err)
+	}
+	if _, err := r.tarWriter.Write(buf.Bytes()); err != nil {
+		return resp, fmt.Errorf("dvr: write tar body: %w", err)
+	}
+	if err := r.tarWriter.Flush(); err != nil {
+		return resp, fmt.Errorf("dvr: flush tar writer: %w", err)
+	}
 
-	// Next we need to ensure that the full object is flushed to the tar
-	// stream. We do this by flushing the writer and then syncing the
-	// underlying file descriptor.. This is necessary since we don't know
-	// when the program is going to exit.
-	panicIfError(writer.Flush())
-	//	panicIfError(fd.Sync())
-
-	// Success!
 	return resp, realErr
 }

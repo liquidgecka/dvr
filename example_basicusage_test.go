@@ -15,48 +15,87 @@
 package dvr_test
 
 import (
+	"flag"
+	"fmt"
+	"io"
 	"net/http"
-	"net/url"
-	"testing"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 
-	_ "github.com/orchestrate-io/dvr"
+	"github.com/liquidgecka/dvr"
 )
 
-// When running this test you can run it in one of three modes:
-//
-// Pass through: In this mode nothing is recorded or replayed.
-//   go test .
-//
-// Recording: In this mode all HTTP calls are recorded into a file (the default
-//            is testdata/archive.dvr, and is control by -dvr.file)
-//   go test -dvr.record .
-//
-// Replay: In this mode all HTTP calls are replayed from the recording file
-//         captured in Recording mode above.
-//   go test -dvr.replay .
-//
-// * Note that this function needs the leading underscore removed in order
-//   to work in the real world. It exists purely because of the rules around
-//   "playable" document examples.
-func _TestCallToApi(t *testing.T) {
-	var err error
-	req := &http.Request{}
-	req.URL, err = url.Parse("http://golang.org")
-	resp, err := http.DefaultClient.Do(req)
+func Example_recordAndReplay() {
+	dir, err := os.MkdirTemp("", "dvr-example-*")
 	if err != nil {
-		t.Fatalf("Error from net.http: %s", err)
-	} else if resp.StatusCode != 200 {
-		t.Fatalf("Bad status code: %d", resp.StatusCode)
+		panic(err)
 	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	archivePath := filepath.Join(dir, "archive.dvr")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintln(w, "hello from server")
+	}))
+	defer server.Close()
+
+	// Step 1: Record an HTTP exchange to the archive file.
+	rec, err := dvr.New(
+		dvr.WithMode(dvr.ModeRecord),
+		dvr.WithFile(archivePath),
+		dvr.WithTransport(server.Client().Transport),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	resp, err := rec.Client().Get(server.URL + "/greeting")
+	if err != nil {
+		panic(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if err := rec.Close(); err != nil {
+		panic(err)
+	}
+
+	// Shut down the server to demonstrate offline replay.
+	server.Close()
+
+	// Step 2: Replay the recorded exchange without network access.
+	rep, err := dvr.New(
+		dvr.WithMode(dvr.ModeReplay),
+		dvr.WithFile(archivePath),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = rep.Close() }()
+
+	replayedResp, err := rep.Client().Get(server.URL + "/greeting")
+	if err != nil {
+		panic(err)
+	}
+	body, err := io.ReadAll(replayedResp.Body)
+	_ = replayedResp.Body.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("%d %s", replayedResp.StatusCode, body)
+	// Output:
+	// 200 hello from server
 }
 
-// For the most basic of use cases you need only ensure that the dvr library
-// is included in your test file. Including it with an underscore, like in
-// this example, is all that is necessary to get it in place.
-func Example_basicUsage() {
-	// Though this library can be used outside of golang's testing library
-	// its not recommended. This main() exists only to make the example
-	// render in godoc.
+func ExampleRegisterFlags() {
+	fs := flag.NewFlagSet("example", flag.ContinueOnError)
+	flags := dvr.RegisterFlags(fs)
 
+	if err := fs.Parse([]string{"-dvr.replay", "-dvr.file", "testdata/custom.dvr"}); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(flags.Mode(), flags.File())
 	// Output:
+	// replay testdata/custom.dvr
 }

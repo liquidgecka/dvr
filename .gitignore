@@ -1,2 +1,5 @@
 dvr
 *.swp
+*.test
+*.out
+coverage.out

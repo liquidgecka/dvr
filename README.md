@@ -1,41 +1,92 @@
 # DVR
 
-DVR is a library for capturing and replaying HTTP calls for golang tests.
+[![CI](https://github.com/liquidgecka/dvr/actions/workflows/ci.yml/badge.svg)](https://github.com/liquidgecka/dvr/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/liquidgecka/dvr.svg)](https://pkg.go.dev/github.com/liquidgecka/dvr)
+
+DVR is a Go library for capturing and replaying HTTP calls during tests.
+
+Inspired by Python's [VCR.py](https://github.com/kevin1024/vcrpy), DVR provides
+an explicit, concurrency-safe `http.RoundTripper` implementation (`dvr.Recorder`)
+that supports passthrough, recording, and offline replay modes without global
+state or `init()` side effects.
 
 ## Installation
 
 ```bash
-go get github.com/orchestrate-io/dvr
+go get github.com/liquidgecka/dvr
 ```
+
+Requires Go 1.26 or later.
 
 ## Usage
 
-The functionality is primarily documented in the [godoc documentation](http://godoc.org/github.com/orchestrate-io/dvr), however
-a high level is provided here.
+Create a `*dvr.Recorder` in your test using `dvr.NewForTest` (which
+automatically flushes and closes the archive via `t.Cleanup`) or `dvr.New`:
 
-This library is intended to allow off line testing of remote API calls. It can
-be run against the test once in a "record" mode which captures all the queries
-and stores them in a file. A second test run can then be put into "replay"
-mode which will match incoming queries against those in the stored file.
+```go
+package mypkg_test
 
-The inspiration for this library came from the
-[Python VCR library.](https://github.com/kevin1024/vcrpy). Though the concept
-is the same several key components have been change to make it more
-idiomatic golang.
+import (
+	"io"
+	"net/http"
+	"testing"
 
-## Testing
+	"github.com/liquidgecka/dvr"
+)
 
-[![Continuous Integration](https://secure.travis-ci.org/orchestrate-io/dvr.svg?branch=master)](http://travis-ci.org/orchestrate-io/dvr)
-[![Documentation](http://godoc.org/github.com/orchestrate-io/dvr?status.png)](http://godoc.org/github.com/orchestrate-io/dvr)
-[![Coverage](https://img.shields.io/coveralls/orchestrate-io/dvr.svg)](https://coveralls.io/r/orchestrate-io/dvr)
+func TestAPI(t *testing.T) {
+	rec := dvr.NewForTest(t,
+		dvr.WithMode(dvr.ModeReplay),
+		dvr.WithFile("testdata/api.dvr"),
+	)
+
+	resp, err := rec.Client().Get("https://api.example.com/resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	_, _ = io.ReadAll(resp.Body)
+}
+```
+
+### Command-Line Flags
+
+If you want `go test` flags (`-dvr.record`, `-dvr.replay`, `-dvr.passthrough`,
+and `-dvr.file`), register them explicitly in your test package:
+
+```go
+var dvrFlags = dvr.RegisterFlags(nil)
+
+func TestWithFlags(t *testing.T) {
+	rec := dvr.NewForTest(t, dvrFlags.Options()...)
+	client := rec.Client()
+	_ = client
+}
+```
+
+You can then run tests in any mode:
+
+```bash
+go test ./...                                   # passthrough (default)
+go test ./... -dvr.record -dvr.file testdata/api.dvr
+go test ./... -dvr.replay -dvr.file testdata/api.dvr
+```
+
+### Credential Obfuscation & Custom Matching
+
+* Use `dvr.WithObfuscator(dvr.BasicAuthObfuscator("user", "pass"))` to scrub
+  HTTP Basic Auth credentials before requests are saved to disk.
+* Use `dvr.WithMatcher(...)` to customize how incoming requests are matched
+  against recorded entries during replay.
+
+See the full API documentation on [pkg.go.dev](https://pkg.go.dev/github.com/liquidgecka/dvr).
 
 ## Contribution
 
-Pull requests will be reviewed and accepted via github.com, and issues will be
-worked on as time permits. New feature requests should be filed as an issue
-against the github repo.
+Pull requests and issues are welcome via GitHub.
 
-## License (Apache 2)
+## License (Apache 2.0)
 
 Copyright 2014 Orchestrate, Inc.
 
@@ -45,22 +96,8 @@ You may obtain a copy of the License at
 
   http://www.apache.org/licenses/LICENSE-2.0
 
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-date
-Wed Apr  1 13:56:33 MDT 2015
-Wed Apr  1 14:02:23 MDT 2015
-Wed Apr  1 14:05:05 MDT 2015
-Wed Apr  1 14:08:05 MDT 2015
-Wed Apr  1 14:08:28 MDT 2015
-Wed Apr  1 14:09:48 MDT 2015
-Wed Apr  1 14:14:06 MDT 2015
-Wed Apr  1 14:16:30 MDT 2015
-Wed Apr  1 14:17:49 MDT 2015
-Wed Apr  1 14:19:09 MDT 2015
-Wed Apr  1 14:19:43 MDT 2015
-Wed Apr  1 14:23:32 MDT 2015
-Wed Apr  1 14:23:50 MDT 2015
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

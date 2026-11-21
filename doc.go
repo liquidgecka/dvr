@@ -12,35 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package dvr attempts to make testing far easier by allowing calls to remote
-// HTTP services to be captured and replayed when running the tests a second
-// time.
+// Package dvr captures and replays HTTP requests and responses for Go tests.
 //
-// In recording mode (-dvr.record) each request will be captured and recorded
-// to a file (-dvr.file, which defaults to testdata/archive.dvr). In replay
-// mode each request will be matched against of the requests in the archive.
-// This ensures that a unit test can remove all dependencies on remote services
-// while running, which is ideal for most testing environments.
+// A [Recorder] implements [http.RoundTripper] and [io.Closer] and operates in
+// one of three [Mode] values:
 //
-// Note that this library works be replaying net.http's DefaultTransport
-// with one that will intercept queries. If you are using a custom client,
-// or replacing the http.DefaultTransport you may need to sub a RoundTripper
-// from this package in place.
+//   - [ModePassthrough]: forwards requests directly to the underlying transport.
+//   - [ModeRecord]: forwards requests to the underlying transport and writes each
+//     request/response exchange into a compressed archive file.
+//   - [ModeReplay]: loads a recorded archive file and responds to matching
+//     requests without making network calls.
 //
-// All common error types will be preserved and returned via the archive,
-// however some types can not be restored due to the way that gob works. In
-// these cases an error will be returned that satisfies the error interface
-// but it will be a different type.
+// Construct a recorder explicitly with [New] (calling [Recorder.Close] when
+// finished) or [NewForTest] (which automatically closes the recorder via
+// [testing.TB.Cleanup]). Behavior can be customized with functional [Option]
+// helpers such as [WithMode], [WithFile], [WithTransport], [WithMatcher], and
+// [WithObfuscator]. Command-line flag integration is opt-in via
+// [RegisterFlags].
 //
-// When in replay mode requests are matched if all of the following are the
-// same: URL, Body, Headers, Trailers. If all of these elements are the
-// same as a recorded request then the response will be returned to the
-// client. If no request matches then the test will panic since re-requesting
-// may cause all sorts of issues. If this matching strategy is not sufficient
-// then you can make value Match() contain a function that can parse two
-// requests and establish if they are the same.
+// When replaying, [DefaultMatcher] matches requests based on HTTP method, URL,
+// request body, headers, and trailers, marking each recorded entry as consumed
+// once matched. If no recorded entry matches, [Recorder.RoundTrip] returns a
+// [*NoMatchError] (which satisfies `errors.Is(err, ErrNoMatch)`). Custom
+// matching logic can be supplied with [WithMatcher].
 //
-// This library is intended to be user during unit testing so much of its
-// design is wrapped around this, and while it can be used outside of unit
-// tests it is strongly not recommended.
+// Sensitive request data (such as credentials) can be scrubbed before saving to
+// disk using [WithObfuscator] and helpers such as [BasicAuthObfuscator].
+//
+// Common standard library errors and sentinel errors (such as [io.EOF],
+// [io.ErrUnexpectedEOF], [context.Canceled], and [context.DeadlineExceeded])
+// are preserved across record and replay. Additional concrete error types can
+// be registered with [RegisterErrorType]; unregistered errors fall back to an
+// error preserving the original message.
+//
+// This library is intended for use during testing and is not recommended for
+// production HTTP traffic.
 package dvr
